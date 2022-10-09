@@ -1,0 +1,14 @@
+Package: XSBART
+Type: Package
+Title: XSBART: Accelerated Soft Bayesian Additive Regression Trees
+Version: 1.0
+Date: 2021-02-28
+Author: RAN HAO
+Maintainer: Ran Hao <ranhao@163.shufe.edu.cn>
+Description: A highly efficient prediction algorithm based on Soft BART.
+License: Apache License (== 2.0)
+Depends: glmnet
+Imports: Rcpp (>= 0.12.13)
+LinkingTo: Rcpp, RcppArmadillo
+NeedsCompilation: yes
+Packaged: 2021-10-26 06:19:13 UTC; recti

@@ -1,0 +1,2904 @@
+#include "tree.h"
+#include <chrono>
+#include "omp.h"
+#include <ctime>
+
+
+
+
+using namespace std;
+using namespace chrono;
+
+
+arma::vec rmvnorm(const arma::vec& mean, const arma::mat& Precision) 
+{
+  arma::vec z = arma::zeros<arma::vec>(mean.size());
+  z.randn();
+  arma::mat Sigma = arma::inv_sympd(Precision);
+  arma::mat L = arma::chol(Sigma, "lower");
+  arma::vec h = mean + L * z;
+  return h;
+}
+
+
+void Vec_To_Matrix(const arma::vec &v,matrix<double> & M,size_t tree_ind)
+{
+    assert(v.n_elem ==M[tree_ind].size());
+    for (size_t i=0;i<v.n_elem;i++)
+    {
+        M[tree_ind][i]=v(i);
+    }
+    
+}
+//CK
+double update_sigma_r(const arma::vec& r, double sigma_hat, double sigma_old) 
+{
+
+  double SSE = arma::dot(r,r) ;
+  double n = r.size() ;
+
+  double shape = 0.5 * n + 1.0;
+  double scale = 2.0 / SSE;
+  double sigma_prop = pow(Rf_rgamma(shape, scale), -0.5);
+
+  double tau_prop = pow(sigma_prop, -2.0);
+  double tau_old = pow(sigma_old, -2.0);
+
+  double loglik_rat = cauchy_jacobian(tau_prop, sigma_hat) -   cauchy_jacobian(tau_old, sigma_hat);
+
+  return log(unif_rand()) < loglik_rat ? sigma_prop : sigma_old;
+
+}
+
+//CK
+double cauchy_jacobian(double tau, double sigma_hat) 
+{
+  double sigma = pow(tau, -0.5);
+  int give_log = 1;
+
+  double out = Rf_dcauchy(sigma, 0.0, sigma_hat, give_log);
+  out -=  3.0 / 2.0 * log(tau);
+
+  return out;
+
+}
+
+
+//--------------------
+// node id
+size_t tree::nid() const
+{
+    if (!p)
+        return 1; //if you don't have a parent, you are the top
+    if (this == p->l)
+        return 2 * (p->nid()); //if you are a left child
+    else
+        return 2 * (p->nid()) + 1; //else you are a right child
+}
+//--------------------
+tree::tree_p tree::getptr(size_t nid)
+{
+    if (this->nid() == nid)
+        return this; //found it
+    if (l == 0)
+        return 0; //no children, did not find it
+    tree_p lp = l->getptr(nid);
+    if (lp)
+        return lp; //found on left
+    tree_p rp = r->getptr(nid);
+    if (rp)
+        return rp; //found on right
+    return 0;      //never found it
+}
+//--------------------
+
+//--------------------
+//depth of node
+// size_t tree::depth()
+// {
+//     if (!p)
+//         return 0; //no parents
+//     else
+//         return (1 + p->depth());
+// }
+//--------------------
+//tree size
+
+void tree::UpdateNodewidth(std::unique_ptr<State> &state,  NormalModel *model,double &loglik_old,tree::tree_p Nodep,size_t num_leaves,size_t widthInd) 
+{
+//   ofstream outputfile; 
+//   outputfile.open ("log-uw.csv",ios::app);
+
+ 
+  double per_new;
+  double width_new;
+  //double per_new = width_proposal(Nodep->fper);
+  width_new=Nodep->cWidth[widthInd];
+  per_new=Nodep->cWidth[widthInd+cStep+1];
+  
+  
+  
+
+//   outputfile<<Nodep->fper<<","<<Nodep->fWidth<<","<<per_new<<","<<width_new<<",";
+
+  double loglik_new = loglik_width(state,model,Nodep,num_leaves,width_new) ;
+  //outputfile<<loglik_new<<","<<loglik_old<<std::endl;
+  
+
+  if (loglik_new>loglik_old)
+  {
+    Nodep->fWidth=width_new;
+    Nodep->fper=per_new;
+    loglik_old=loglik_new;
+  }
+//   outputfile.close();
+
+
+
+
+}
+
+// void tree::UpdateNodewidth(std::unique_ptr<State> &state,  NormalModel *model,double &loglik_old,tree::tree_p Nodep,size_t num_leaves,size_t widthInd) 
+// {
+//   ofstream outputfile; 
+//   outputfile.open ("log-uw.csv",ios::app);
+
+//   outputfile<<",fper,"<<Nodep->fper<<",";
+//   double per_new = width_proposal(Nodep->fper);
+//   outputfile<<"newfer,"<<per_new<<",";
+//   double width_new=findWidth(per_new,Nodep,PerMatrix_std);
+//   outputfile<<"newdith,"<<width_new<<",";
+
+//   double loglik_new = loglik_width(state,model,Nodep,num_leaves,width_new) +logprior_width(per_new, state->width_rate); ;
+//   outputfile<<"newloglik,"<<loglik_new<<",";
+//   outputfile<<"oldloglik,"<<loglik_old<<std::endl;
+  
+
+//   if (loglik_new>loglik_old)
+//   {
+//     Nodep->fWidth=width_new;
+//     Nodep->fper=per_new;
+//     loglik_old=loglik_new;
+//   }
+//   outputfile.close();
+
+
+
+
+// }
+
+
+double findWidth(double per_new,tree::tree_p Nodep,arma::mat &PerMatrix_std)
+{
+    double out;
+    double out1;
+    double out2;
+    size_t Temp_v=Nodep->getv();
+    //COUT<<"Temp_v"<<Temp_v<<std::endl;
+    if ((Nodep->nxp)<per_new*1000)
+    {
+        if((Nodep->nxp+per_new*1000)<1000)
+        {
+            //COUT<<"L"<<Nodep->nxp+per_new*1000<<"U"<<Nodep->nxp<<endl;
+            out=PerMatrix_std(Temp_v,(size_t)(Nodep->nxp+per_new*1000))-PerMatrix_std(Temp_v,Nodep->nxp);
+        }
+        else
+        {
+            //COUT<<"L"<<1000<<"U"<<0<<endl;
+            out1=PerMatrix_std(Temp_v,1000)-PerMatrix_std(Temp_v,Nodep->nxp);
+            out2=PerMatrix_std(Temp_v,Nodep->nxp)-PerMatrix_std(Temp_v,0);
+            out=max(out1,out2);
+
+        }
+    }
+    else
+    {
+        if((Nodep->nxp+per_new*1000)<1000)
+        {
+            //COUT<<"L"<<Nodep->nxp+per_new*1000<<"U"<<Nodep->nxp-per_new*1000<<endl;
+            out=(PerMatrix_std(Temp_v,(size_t)(Nodep->nxp+per_new*1000))-PerMatrix_std(Temp_v,(size_t)(Nodep->nxp-per_new*1000)))/2;
+        }
+        else
+        {
+            //COUT<<"L"<<Nodep->nxp<<"U"<<Nodep->nxp-per_new*1000<<endl;
+            out=PerMatrix_std(Temp_v, Nodep->nxp)-PerMatrix_std(Temp_v,(size_t)(Nodep->nxp-per_new*1000));
+        }
+
+    }
+    return out;
+}
+
+
+
+
+
+double width_proposal(double width) 
+{
+  double U = 2.0 * unif_rand() - 1;
+  return pow(5.0, U) * width;
+}
+
+
+double tree::loglik_width(std::unique_ptr<State> &state,  NormalModel *model,tree::tree_p Nodep,size_t num_leaves,double width_new) 
+{
+  double width_old = Nodep->fWidth;
+  Nodep->fWidth=width_new;
+  double out = LogLT(state,model);
+  Nodep->fWidth=width_old;
+  return out;
+}
+
+
+double logprior_width(double width, double width_rate) 
+{
+  int DO_LOG = 1;
+  return Rf_dexp(width, 1.0 / width_rate, DO_LOG);
+}
+
+
+double log_width_trans(double width_new) 
+{
+  return -log(width_new);
+}
+
+bool do_mh(double loglik_new, double loglik_old,double new_to_old, double old_to_new) 
+{
+  double cutoff = loglik_new + new_to_old - loglik_old - old_to_new;
+  return log(unif_rand()) < cutoff ? true : false;
+}
+
+
+size_t tree::treesize()
+{
+    if (l == 0)
+        return 1; //if bottom node, tree size is 1
+    else
+        return (1 + l->treesize() + r->treesize());
+}
+//--------------------
+//node type
+char tree::ntype()
+{
+    //t:top, b:bottom, n:no grandchildren, i:internal
+    if (!p)
+        return 't';
+    if (!l)
+        return 'b';
+    if (!(l->l) && !(r->l))
+        return 'n';
+    return 'i';
+}
+//--------------------
+//print out tree(pc=true) or node(pc=false) information
+void tree::pr(bool pc)
+{
+    size_t d = this->depth;
+    size_t id = nid();
+
+    size_t pid;
+    if (!p)
+        pid = 0; //parent of top node
+    else
+        pid = p->nid();
+
+    std::string pad(2 * d, ' ');
+    std::string sp(", ");
+    if (pc && (ntype() == 't'))
+        COUT << "tree size: " << treesize() << std::endl;
+    COUT << pad << "(id,parent): " << id << sp << pid;
+    COUT << sp << "(v,c): " << v << sp << c;
+    COUT << sp << "theta: " << theta_vector;
+    COUT << sp << "type: " << ntype();
+    COUT << sp << "depth: " << this->depth;
+    COUT << sp << "pointer: " << this << std::endl;
+
+    if (pc)
+    {
+        if (l)
+        {
+            l->pr(pc);
+            r->pr(pc);
+        }
+    }
+}
+
+//--------------------
+//is the node a nog node
+bool tree::isnog()
+{
+    bool isnog = true;
+    if (l)
+    {
+        if (l->l || r->l)
+            isnog = false; //one of the children has children.
+    }
+    else
+    {
+        isnog = false; //no children
+    }
+    return isnog;
+}
+//--------------------
+size_t tree::nnogs()
+{
+    if (!l)
+        return 0; //bottom node
+    if (l->l || r->l)
+    { //not a nog
+        return (l->nnogs() + r->nnogs());
+    }
+    else
+    { //is a nog
+        return 1;
+    }
+}
+//--------------------
+size_t tree::nbots()
+{
+    if (l == 0)
+    { //if a bottom node
+        return 1;
+    }
+    else
+    {
+        return l->nbots() + r->nbots();
+    }
+}
+//--------------------
+//get bottom nodes
+void tree::getbots(npv &bv)
+{
+    if (l)
+    { //have children
+        l->getbots(bv);
+        r->getbots(bv);
+    }
+    else
+    {
+        bv.push_back(this);
+    }
+}
+//--------------------
+//get nog nodes
+void tree::getnogs(npv &nv)
+{
+    if (l)
+    { //have children
+        if ((l->l) || (r->l))
+        { //have grandchildren
+            if (l->l)
+                l->getnogs(nv);
+            if (r->l)
+                r->getnogs(nv);
+        }
+        else
+        {
+            nv.push_back(this);
+        }
+    }
+}
+//--------------------
+//get pointer to the top tree
+tree::tree_p tree::gettop()
+{
+    if (!p)
+    {
+        return this;
+    }
+    else
+    {
+        return p->gettop();
+    }
+}
+//--------------------
+//get all nodes
+void tree::getnodes(npv &v)
+{
+    v.push_back(this);
+    if (l)
+    {
+        l->getnodes(v);
+        r->getnodes(v);
+    }
+}
+
+// void tree::getLknodes(NodesVector &Nv)
+// {   
+
+//     linknode * P1=new linknode;
+//     P1->id=ID;
+//     P1->inNode=  (l != 0);
+//     P1->right=0;
+//     P1->left=0;
+//     P1->v=v;
+//     P1->c=c;
+//     Nv.push_back(P1);
+//     if (l)
+//     {
+
+//         l->getLknodes(Nv);
+
+//         r->getLknodes(Nv);
+//     }
+// }
+
+
+
+
+
+void tree::getnodes(cnpv &v) const
+{
+    v.push_back(this);
+    if (l)
+    {
+        l->getnodes(v);
+        r->getnodes(v);
+    }
+}
+//--------------------
+tree::tree_p tree::bn(double *x, matrix<double> &xi)
+{
+
+    // original BART function, v and c are index of split point in matrix<double>& xi
+
+    if (l == 0)
+        return this; //no children
+    if (x[v] <= xi[v][c])
+    {
+        // if smaller than or equals to the cutpoint, go to left child
+
+        return l->bn(x, xi);
+    }
+    else
+    {
+        // if greater than cutpoint, go to right child
+        return r->bn(x, xi);
+    }
+}
+
+tree::tree_p tree::bn_std(double *x)
+{
+    // v is variable to split, c is raw value
+    // not index in matrix<double>, so compare x[v] with c directly
+
+    if (l == 0)
+        return this;
+    if (x[v] <= c)
+    {
+        return l->bn_std(x);
+    }
+    else
+    {
+        return r->bn_std(x);
+    }
+}
+
+tree::tree_p tree::search_bottom_std(const double *X, const size_t &i, const size_t &p, const size_t &N)
+{
+    // X is a matrix, std vector of vectors, stack by column, N rows and p columns
+    // i is index of row in X to predict
+    if (l == 0)
+    {
+        return this;
+    }
+    // X[v][i], v-th column and i-th row
+    // if(X[v][i] <= c){
+    if (*(X + N * v + i) <= c)
+    {
+        return l->search_bottom_std(X, i, p, N);
+    }
+    else
+    {
+        return r->search_bottom_std(X, i, p, N);
+    }
+}
+
+//--------------------
+//find region for a given variable
+void tree::rg(size_t v, size_t *L, size_t *U)
+{
+    if (this->p == 0)
+    {
+        return;
+    }
+    if ((this->p)->v == v)
+    { //does my parent use v?
+        if (this == p->l)
+        { //am I left or right child
+            if ((size_t)(p->c) <= (*U))
+                *U = (p->c) - 1;
+            p->rg(v, L, U);
+        }
+        else
+        {
+            if ((size_t)(p->c) >= *L)
+                *L = (p->c) + 1;
+            p->rg(v, L, U);
+        }
+    }
+    else
+    {
+        p->rg(v, L, U);
+    }
+}
+//--------------------
+//cut back to one node
+void tree::tonull()
+{
+    size_t ts = treesize();
+    //loop invariant: ts>=1
+    while (ts > 1)
+    { //if false ts=1
+        npv nv;
+        getnogs(nv);
+        for (size_t i = 0; i < nv.size(); i++)
+        {
+            delete nv[i]->l;
+            delete nv[i]->r;
+            nv[i]->l = 0;
+            nv[i]->r = 0;
+        }
+        ts = treesize(); //make invariant true
+    }
+    v = 0;
+    c = 0;
+    p = 0;
+    l = 0;
+    r = 0;
+}
+//--------------------
+//copy tree tree o to tree n
+void tree::cp(tree_p n, tree_cp o)
+//assume n has no children (so we don't have to kill them)
+//recursion down
+// create a new copy of tree in NEW memory space
+{
+    if (n->l)
+    {
+        COUT << "cp:error node has children\n";
+        return;
+    }
+
+    n->v = o->v;
+    n->c = o->c;
+    n->prob_split = o->prob_split;
+    n->prob_leaf = o->prob_leaf;
+    n->drawn_ind = o->drawn_ind;
+    n->loglike_node = o->loglike_node;
+    n->tree_like = o->tree_like;
+    n->theta_vector = o->theta_vector;
+    n->fWidth = o->fWidth;
+    
+
+    if (o->l)
+    { //if o has children
+        n->l = new tree;
+        (n->l)->p = n;
+        cp(n->l, o->l);
+        n->r = new tree;
+        (n->r)->p = n;
+        cp(n->r, o->r);
+    }
+}
+
+void tree::copy_only_root(tree_p o)
+//assume n has no children (so we don't have to kill them)
+//NOT LIKE cp() function
+//this function pointer new root to the OLD structure
+{
+    this->v = o->v;
+    this->c = o->c;
+    this->prob_split = o->prob_split;
+    this->prob_leaf = o->prob_leaf;
+    this->drawn_ind = o->drawn_ind;
+    this->loglike_node = o->loglike_node;
+    this->tree_like = o->tree_like;
+    this->theta_vector = o->theta_vector;
+
+    if (o->l)
+    {
+        // keep the following structure, rather than create a new tree in memory
+        this->l = o->l;
+        this->r = o->r;
+        // also update pointers to parents
+        this->l->p = this;
+        this->r->p = this;
+    }
+    else
+    {
+        this->l = 0;
+        this->r = 0;
+    }
+}
+
+json tree::to_json()
+{
+    json j;
+    if (l == 0)
+    {
+        j = this->theta_vector;
+    }
+    else
+    {
+        j["variable"] = this->v;
+        j["cutpoint"] = this->c;
+        j["nodeid"] = this->nid();
+        j["left"] = this->l->to_json();
+        j["right"] = this->r->to_json();
+    }
+    return j;
+}
+
+void tree::from_json(json &j3, size_t dim_theta)
+{
+    if (j3.is_array())
+    {
+        std::vector<double> temp;
+        j3.get_to(temp);
+        if (temp.size() > 1)
+        {
+            this->theta_vector = temp;
+        }
+        else
+        {
+            this->theta_vector[0] = temp[0];
+        }
+    }
+    else
+    {
+        j3.at("variable").get_to(this->v);
+        j3.at("cutpoint").get_to(this->c);
+
+        tree *lchild = new tree(dim_theta);
+        lchild->from_json(j3["left"], dim_theta);
+        tree *rchild = new tree(dim_theta);
+        rchild->from_json(j3["right"], dim_theta);
+
+        lchild->p = this;
+        rchild->p = this;
+        this->l = lchild;
+        this->r = rchild;
+    }
+}
+
+//--------------------------------------------------
+//operators
+tree &tree::operator=(const tree &rhs)
+{
+    if (&rhs != this)
+    {
+        tonull();       //kill left hand side (this)
+        cp(this, &rhs); //copy right hand side to left hand side
+    }
+    return *this;
+}
+//--------------------------------------------------
+std::ostream &operator<<(std::ostream &os, const tree &t)
+{
+    tree::cnpv nds;
+    t.getnodes(nds);
+    // print size of theta first
+    os << nds[0]->theta_vector.size() << std::endl;
+    // next print number of nodes
+    os << nds.size() << std::endl;
+    for (size_t i = 0; i < nds.size(); i++)
+    {
+        os << nds[i]->nid() << " ";
+        os << nds[i]->getv() << " ";
+        os << nds[i]->getc();
+        //   os << nds[i]->theta_vector[0] << std::endl;
+        for (size_t kk = 0; kk < nds[i]->theta_vector.size(); kk++)
+        {
+            // be caucious, one space between c and theta
+            os << " " << nds[i]->theta_vector[kk];
+        }
+        os << endl;
+    }
+    return os;
+}
+
+std::istream &operator>>(std::istream &is, tree &t)
+{
+    size_t tid, pid;                    //tid: id of current node, pid: parent's id
+    std::map<size_t, tree::tree_p> pts; //pointers to nodes indexed by node id
+    size_t nn;                          //number of nodes
+
+    t.tonull(); // obliterate old tree (if there)
+
+    // read size of theta first
+    size_t theta_size;
+    is >> theta_size;
+
+    //read number of nodes----------
+    is >> nn;
+    if (!is)
+    {
+        return is;
+    }
+
+    // The idea is to dump string to a lot of node_info structure first, then link them as a tree, by nid
+
+    //read in vector of node information----------
+    std::vector<node_info> nv(nn);
+    for (size_t i = 0; i != nn; i++)
+    {
+        is >> nv[i].id >> nv[i].v >> nv[i].c; // >> nv[i].theta_vector[0]; // Only works on first theta for now, fix latex if needed
+        for (size_t kk = 0; kk < theta_size; kk++)
+        {
+            is >> nv[i].theta_vector[kk];
+        }
+        if (!is)
+        {
+            return is;
+        }
+    }
+
+    //first node has to be the top one
+    pts[1] = &t; //be careful! this is not the first pts, it is pointer of id 1.
+    t.setv(nv[0].v);
+    t.setc(nv[0].c);
+    t.settheta(nv[0].theta_vector);
+    t.p = 0;
+
+    //now loop through the rest of the nodes knowing parent is already there.
+    for (size_t i = 1; i != nv.size(); i++)
+    {
+        tree::tree_p np = new tree;
+        np->v = nv[i].v;
+        np->c = nv[i].c;
+        np->theta_vector = nv[i].theta_vector;
+        tid = nv[i].id;
+        pts[tid] = np;
+        pid = tid / 2;
+        if (tid % 2 == 0)
+        { //left child has even id
+            pts[pid]->l = np;
+        }
+        else
+        {
+            pts[pid]->r = np;
+        }
+        np->p = pts[pid];
+    }
+    return is;
+}
+
+// double tree::tree_likelihood(size_t N, double sigma, size_t tree_ind, Model *model, std::unique_ptr<State>& state, const double *Xpointer, vector<double>& y, bool proposal)
+// {
+//     /*
+//         This function calculate the log of
+//         the likelihood of all leaf parameters of given tree
+//     */
+//     double output = 0.0;
+//     std::vector<double> pred(N);
+//     if(proposal){
+//         // calculate likelihood of proposal
+//         predict_from_datapointers(Xpointer, N, tree_ind, pred, state->data_pointers, model);
+//     }else{
+//         // calculate likelihood of previous accpeted tree
+//         predict_from_datapointers(Xpointer, N, tree_ind, pred, state->data_pointers_copy, model);
+//     }
+
+//     double sigma2 = pow(sigma, 2);
+
+//     for(size_t i = 0; i < N; i ++ ){
+//         output = output + normal_density(y[i], pred[i], sigma2, true);
+//     }
+
+//     return output;
+// }
+
+double tree::prior_prob(NormalModel *model)
+{
+
+    double log_split_prob = 0.0;
+
+    tree::npv tree_vec;
+
+    // get a vector of all nodess
+    getnodes(tree_vec);
+
+    for (size_t i = 0; i < tree_vec.size(); i++)
+    {
+        if (tree_vec[i]->getl() == 0)
+        {
+            log_split_prob += log(1.0 - model->alpha * pow(1 + tree_vec[i]->getdepth(), -1.0 * model->beta));
+        }
+        else
+        {
+            log_split_prob += log(model->alpha) - model->beta * log(1.0 + tree_vec[i]->getdepth());
+        }
+    }
+    return log_split_prob;
+}
+
+
+double tree::updateWidth(std::unique_ptr<State> &state, matrix<size_t> &Xorder_std, std::vector<size_t> &X_counts, std::vector<size_t> &X_num_unique, NormalModel *model, std::unique_ptr<X_struct> &x_struct, const size_t &sweeps, const size_t &tree_ind,arma::mat &PerMatrix_std)
+{
+    //ofstream outputfile1; 
+    //outputfile1.open ("log-CW.csv",ios::app);
+    // NodesVector Nv;
+    //getLknodes(Nv);
+    bool bupdateWidth=false; 
+    npv Nv;
+    getnodes(Nv);
+    size_t ValidUpdate=0;
+    
+    //COUT <<"Nv size"<<Nv.size()<<std::endl;
+    for(size_t i=0;i<Nv.size();i++)
+    {
+        for(size_t t1=0;t1<=2*cStep+2;t1++)
+        {
+            Nv[i]->cWidth[t1]=0;
+        }
+
+        if (Nv[i]->l)
+        {   
+            size_t Temp_v=Nv[i]->v;
+            if(Temp_v <state->p_continuous)
+            {
+                bupdateWidth=true;
+                Nv[i]->cWidth[0]=1;
+                size_t s_j=0;
+                size_t s_k=1000;
+                size_t s_m;
+                ValidUpdate++;
+                if ((Nv[i]->c < PerMatrix_std(Temp_v,s_j)) || (Nv[i]->c > PerMatrix_std(Temp_v,s_k)))
+                {
+                    COUT <<"Wrong Range"<<std::endl;
+                }
+                else
+                {
+                    while ( (Nv[i]->c > PerMatrix_std(Temp_v,s_j) ) &&  (Nv[i]->c <= PerMatrix_std(Temp_v,s_k)) && (s_k-s_j>1 ) )
+                    {
+                        s_m=(s_j+s_k)/2;
+                        if (Nv[i]->c <= PerMatrix_std(Temp_v,s_m))
+                        {
+                            s_k=s_m;
+                        }
+                        else
+                        {
+                            s_j=s_m;
+
+                        }
+
+                    }
+                    Nv[i]->nxp=s_j;
+                    //COUT<<"Node"<<i<<"nxp"<< Nv[i]->nxp<<std::endl;
+                    //outputfile <<"var"<<Nv[i]->v<<" ";
+                    for(size_t j=1;j<=state->RepeatT;j++)
+                    {
+                        if(nxp<state->StepSize*j)
+                        {
+                            Nv[i]->cWidth[j+1]=PerMatrix_std(Temp_v,nxp+state->StepSize*j)-PerMatrix_std(Temp_v,nxp);
+                        }
+                        else if (nxp+state->StepSize*j>1000)
+                        {
+                            Nv[i]->cWidth[j+1]=PerMatrix_std(Temp_v,nxp)-PerMatrix_std(Temp_v,nxp-state->StepSize*j);
+                        }
+                        else
+                        {
+                            Nv[i]->cWidth[j+1]=(PerMatrix_std(Temp_v,nxp+state->StepSize*j)-PerMatrix_std(Temp_v,nxp-state->StepSize*j))/2;
+                        }
+                        
+                        Nv[i]->cWidth[j+cStep+2]=state->StepSize*j/1000.0;
+                        //outputfile << Nv[i]->cWidth[j]<<" ";    
+                    }
+
+                    //outputfile<<std::endl;
+                    // arma::vec inc_1 = arma::linspace(0, cStep, cStep+1);
+                    // arma::vec inc_2 = arma::shuffle(inc_1);
+                    // for(size_t j=0;j<=cStep;j++)
+                    // {
+                    //     Nv[i]->cWidth[j+cStep+2]=Nv[i]->cWidth[(unsigned int)(inc_2(j))+1];
+                    // }
+
+
+                }
+            }
+            else
+            {
+                Nv[i]->cWidth[0]=-1;
+            }
+
+            // for(size_t j=i+1;j<Nv.size();j++)
+            // {
+            //     if(2*Nv[i]->id==Nv[j]->id)
+            //     {
+            //         Nv[i]->left=j;
+            //     }
+            //     else if (2*Nv[i]->id+1==Nv[j]->id)
+            //     {
+            //         Nv[i]->right=j;
+            //         break;
+            //     }
+            // }
+        }
+        else
+        {
+            Nv[i]->cWidth[0]=-1;
+        }
+
+        //outputfile1<<sweeps<<","<<tree_ind<<",";
+        //for(size_t t1=0;t1<=2*cStep+2;t1++)
+        //{
+        //    outputfile1<<Nv[i]->cWidth[t1]<<",";
+        //}
+        //outputfile1<<std::endl;
+    
+    }
+
+
+
+
+
+    //state->RecordTime(1+sweeps*state->num_trees+tree_ind,3); 
+
+    
+    int MaxWidth=1;
+    double Maxresult=-INFINITY;
+    // npv leafs;
+    // getbots(leafs);
+    size_t num_leaves = nbots();
+    //state->RecordTime(1+sweeps*state->num_trees+tree_ind,2); 
+    //state->RecordData(1+sweeps*state->num_trees+tree_ind,3,(bupdateWidth?1.0:0.0));
+
+    if (bupdateWidth) 
+    {   
+        //arma::vec Maxmu_hat =arma::zeros<arma::vec>(num_leaves);
+        //arma::mat MaxOmega_inv = arma::zeros<arma::mat>(num_leaves, num_leaves);
+        
+        double rtemp;
+        //outputfile<<sweeps<<"," << tree_ind<<"," <<model->tau<<"," ;
+        //arma::vec mu_hat[cStep+1];
+        //arma::mat Omega_inv[cStep+1];
+        //COUT <<"update Width count="<<cStep<<std::endl;
+        
+        for (size_t i=1;i<=state->RepeatT+1;i++)
+        {   
+            //mu_hat[i]= arma::zeros<arma::vec>(num_leaves);
+            //Omega_inv[i] = arma::zeros<arma::mat>(num_leaves, num_leaves);
+            //,mu_hat[i],Omega_inv[i]
+            
+                           
+            rtemp=LogLT(state, model, i);
+                           
+            
+            //state->RecordAvg(1+sweeps*state->num_trees+tree_ind,5); 
+            //outputfile <<i<<","<< rtemp<<",";    
+            if (Maxresult<rtemp)
+            {
+                Maxresult=rtemp;
+                MaxWidth=i;
+                //for (size_t j=0;j<num_leaves;j++)
+                // {
+                //     Maxmu_hat(j)=mu_hat(j);
+                //     for  (size_t k=0;k<num_leaves;k++)
+                //     {
+                //         MaxOmega_inv(j,k)=Omega_inv(j,k);
+                //     }
+                // }
+            }  
+        }
+        //state->RecordTime(1+sweeps*state->num_trees+tree_ind,4); 
+        //state->RecordTime(1+sweeps*state->num_trees+tree_ind,5); 
+        //MaxWidth=5;
+        //npv lea;
+        //getbots(lea);
+
+        //for (size_t i=0;i<lea.size();i++)
+        //{  
+        //    outputfile <<lea[i]->cMu<<"," <<lea[i]->theta_vector[0]<<",";
+        //}   
+        //outputfile <<std::endl; 
+
+        //outputfile << MaxWidth<<","<<num_leaves<<",";
+        
+        //for (size_t i=0;i<num_leaves;i++)
+        //{   
+        //    outputfile << Maxmu_hat(i)<<",";
+        //}
+
+        // arma::vec mu_samp = rmvnorm(mu_hat[MaxWidth], Omega_inv[MaxWidth]);
+        // for(int i = 0; i < num_leaves; i++) 
+        // {
+        //     leafs[i]->cMu = mu_samp(i);
+        // }  
+        //COUT<<"MaxWidth"<<MaxWidth<<"Nvsize"<<Nv.size()<<std::endl;
+
+        // for(size_t i=0;i<Nv.size();i++)
+        // {
+        //     Nv[i]->fWidth=Nv[i]->cWidth[MaxWidth];
+        //     if (MaxWidth==1)
+        //     {
+        //         Nv[i]->fper=0.01;
+        //     }
+        //     else
+        //     {
+        //         Nv[i]->fper=cStepSize*(MaxWidth-1)/1000.0;
+        //     }
+        //     //COUT<<Nv[i]->l<<"    nxp"<<Nv[i]->nxp<<"   fper"<<Nv[i]->fper<<"    fwidth"<<Nv[i]->fWidth<<std::endl;
+        // }
+        
+        // double loglik_o=Maxresult;
+        // bool firstUpdate=true;
+
+        // for(size_t i=0;i<Nv.size();i++)
+        // {
+        //     if (Nv[i]->l)
+        //     {   
+        //         size_t Temp_v=Nv[i]->v;
+        //         if(Temp_v <state->p_continuous)
+        //         {
+        //             //COUT<<Nv[i]->l<<"nxp"<<Nv[i]->nxp<<"fper"<<Nv[i]->fper<<"fwidth"<<Nv[i]->fWidth<<std::endl;
+        //             if (firstUpdate)
+        //             {
+        //                 loglik_o+= logprior_width(Nv[i]->fper, state->width_rate);
+        //                 firstUpdate=false;
+        //             }
+        //             for(size_t j=0;j<state->RepeatT;j++)
+        //             {   
+        //                 ofstream outputfile; 
+        //                 outputfile.open ("log-uw.csv",ios::app);
+        //                 outputfile<<"sweeps,"<<sweeps<<",tree_ind,"<<tree_ind<<",total Node,"<<Nv.size()<<",node,"<<i<<",update,"<<j<<",";
+        //                 outputfile.close();
+
+        //                 UpdateNodewidth(state, model,loglik_o,Nv[i],num_leaves,PerMatrix_std);
+        //             }
+        //        }
+                
+        //     }
+        // }
+
+        //state->RecordTime(1+sweeps*state->num_trees+tree_ind,5); 
+        for(size_t i=0;i<Nv.size();i++)
+        {
+            Nv[i]->fWidth=Nv[i]->cWidth[MaxWidth];
+            Nv[i]->fper=state->StepSize*(MaxWidth-1)/1000.0;
+            //COUT<<Nv[i]->l<<"    nxp"<<Nv[i]->nxp<<"   fper"<<Nv[i]->fper<<"    fwidth"<<Nv[i]->fWidth<<std::endl;
+        }
+        
+
+
+        if (ValidUpdate>1 && state->NW_B)
+        {
+            for(size_t i=0;i<Nv.size();i++)
+            {
+                if (Nv[i]->l)
+                {   
+                    //size_t Temp_v=Nv[i]->v;
+                    if(Nv[i]->v <state->p_continuous)
+                    {
+
+                        for(size_t j=1;j<=state->RepeatT+1;j++)
+                        {   
+                            //ofstream outputfile; 
+                            //outputfile.open ("log-uw.csv",ios::app);
+                            //outputfile<<sweeps<<","<<tree_ind<<","<<Nv.size()<<","<<i<<","<<j<<","<<Nv[i]->v<<","<<Nv[i]->c<<",";
+                            //outputfile.close();
+                            //COUT <<"update Node width "<<j<<std::endl;
+
+                            UpdateNodewidth(state, model,Maxresult,Nv[i],num_leaves,j);
+                        }
+                }
+                    
+                }
+            }
+        }
+
+
+    }
+    else
+    {
+       
+        //for(size_t i = 0; i < Nv.size(); i ++ )
+        //{
+        //    Nv[i]->cMu = Nv[i]->theta_vector[0];
+        // }
+        for(size_t i=0;i<Nv.size();i++)
+        {
+            Nv[i]->fWidth=Nv[i]->cWidth[MaxWidth];
+        }
+        Maxresult=LogLT(state, model);
+        
+    }
+    //state->RecordTime(1+sweeps*state->num_trees+tree_ind,5); 
+    return Maxresult;
+
+
+
+
+    //    outputfile << Nv[i]->id<<","<<Nv[i]->inNode<<"," <<Nv[i]->left<<","<<Nv[i]->right<< std::endl;
+    //state->n_y
+    //arma::mat wtMatrix(state->n_y,Nv.size(),arma::fill::zeros);
+    //wtMatrix.col(0).ones();
+    //arma::mat perMatrix(state->n_y,100,arma::fill::zeros);
+
+
+    // for (int i=0;i<5;i++)
+    // {
+    //     for (int j=0;j<Nv.size();j++)
+    //     {
+    //         outputfile <<A(i,j)<<" ";
+    //     }
+    //     outputfile <<std::endl;
+    // }
+
+    // for(size_t i=0;i<Nv.size();i++)
+    // {
+        
+    //     if (Nv[i]->inNode)
+    //     {
+            
+    //         ParseWeigth(state,Xorder_std, model, x_struct,wtMatrix,i,Nv);
+
+    //     }
+    // //    outputfile << Nv[i]->id<<","<<Nv[i]->inNode<<"," <<Nv[i]->left<<","<<Nv[i]->right<< std::endl;
+    // }
+    //outputfile.close();
+
+}
+
+
+// void tree::updateWidth(std::unique_ptr<State> &state, matrix<size_t> &Xorder_std, std::vector<size_t> &X_counts, std::vector<size_t> &X_num_unique, NormalModel *model, std::unique_ptr<X_struct> &x_struct, const size_t &sweeps, const size_t &tree_ind,arma::mat &PerMatrix_std)
+// {
+
+//     //ofstream outputfile; 
+//     //outputfile.open ("log.csv",ios::app);
+ 
+
+//     // NodesVector Nv;
+//     //getLknodes(Nv);
+//     bool updateWidth=false; 
+
+//     npv Nv;
+//     getnodes(Nv);
+    
+
+//     for(size_t i=0;i<Nv.size();i++)
+//     {
+
+//         if (Nv[i]->l)
+//         {   
+//             size_t Temp_v=Nv[i]->v;
+//             if(Temp_v <state->p_continuous)
+//             {
+//                 updateWidth=true;
+//                 Nv[i]->cWidth[0]=1;
+//                 size_t s_j=0;
+//                 size_t s_k=100;
+//                 size_t s_m;
+//                 size_t x_p;
+//                 if ((Nv[i]->c < PerMatrix_std(Temp_v,s_j)) || (Nv[i]->c > PerMatrix_std(Temp_v,s_k)))
+//                 {
+//                     //outputfile <<"Wrong Range"<<std::endl;
+//                 }
+//                 else
+//                 {
+//                     while ( (Nv[i]->c > PerMatrix_std(Temp_v,s_j) ) &&  (Nv[i]->c <= PerMatrix_std(Temp_v,s_k)) && (s_k-s_j>1 ) )
+//                     {
+//                         s_m=(s_j+s_k)/2;
+//                         if (Nv[i]->c <= PerMatrix_std(Temp_v,s_m))
+//                         {
+//                             s_k=s_m;
+//                         }
+//                         else
+//                         {
+//                             s_j=s_m;
+
+//                         }
+
+//                     }
+//                     x_p=s_j;
+//                     //outputfile <<"var"<<Nv[i]->v<<" ";
+//                     for(size_t j=1;j<=cStep;j++)
+//                     {
+//                         if(x_p<cStepSize*j)
+//                         {
+//                             Nv[i]->cWidth[j+1]=PerMatrix_std(Temp_v,x_p+cStepSize*j)-PerMatrix_std(Temp_v,x_p);
+//                         }
+//                         else if (x_p+cStepSize*j>100)
+//                         {
+//                             Nv[i]->cWidth[j+1]=PerMatrix_std(Temp_v,x_p)-PerMatrix_std(Temp_v,x_p-cStepSize*j);
+//                         }
+//                         else
+//                         {
+//                             Nv[i]->cWidth[j+1]=(PerMatrix_std(Temp_v,x_p+cStepSize*j)-PerMatrix_std(Temp_v,x_p-cStepSize*j))/2;
+//                         }
+//                         //outputfile << Nv[i]->cWidth[j]<<" ";    
+//                     }
+//                     //outputfile<<std::endl;
+//                     arma::vec inc_1 = arma::linspace(0, cStep, cStep+1);
+//                     arma::vec inc_2 = arma::shuffle(inc_1);
+//                     for(size_t j=0;j<=cStep;j++)
+//                     {
+//                         Nv[i]->cWidth[j+cStep+2]=Nv[i]->cWidth[(unsigned int)(inc_2(j))+1];
+//                     }
+
+
+//                 }
+//             }
+//             else
+//             {
+//                 Nv[i]->cWidth[0]=-1;
+//             }
+
+//             // for(size_t j=i+1;j<Nv.size();j++)
+//             // {
+//             //     if(2*Nv[i]->id==Nv[j]->id)
+//             //     {
+//             //         Nv[i]->left=j;
+//             //     }
+//             //     else if (2*Nv[i]->id+1==Nv[j]->id)
+//             //     {
+//             //         Nv[i]->right=j;
+//             //         break;
+//             //     }
+//             // }
+//         }
+//         else
+//         {
+//             Nv[i]->cWidth[0]=-1;
+//         }
+    
+//     }
+    
+//     int MaxWidth;
+//     npv leafs;
+//     getbots(leafs);
+//     size_t num_leaves = leafs.size();
+    
+//     if (updateWidth) 
+//     {   
+        
+
+
+//         //arma::vec Maxmu_hat =arma::zeros<arma::vec>(num_leaves);
+//         //arma::mat MaxOmega_inv = arma::zeros<arma::mat>(num_leaves, num_leaves);
+//         double Maxresult=-INFINITY;
+        
+//         double rtemp;
+
+//         //outputfile<<sweeps<<"," << tree_ind<<"," <<model->tau<<"," ;
+//         //arma::vec mu_hat[cStep+1];
+//         //arma::mat Omega_inv[cStep+1];
+//         for (size_t i=1;i<=2*cStep+2;i++)
+//         {   
+            
+//             //mu_hat[i]= arma::zeros<arma::vec>(num_leaves);
+//             //Omega_inv[i] = arma::zeros<arma::mat>(num_leaves, num_leaves);
+//             //,mu_hat[i],Omega_inv[i]
+//             rtemp=LogLT(state, model,num_leaves, i);
+//             //outputfile <<i<<","<< rtemp<<",";    
+//             if (Maxresult<rtemp)
+//             {
+//                 Maxresult=rtemp;
+//                 MaxWidth=i;
+//                 //for (size_t j=0;j<num_leaves;j++)
+//                 // {
+//                 //     Maxmu_hat(j)=mu_hat(j);
+//                 //     for  (size_t k=0;k<num_leaves;k++)
+//                 //     {
+//                 //         MaxOmega_inv(j,k)=Omega_inv(j,k);
+//                 //     }
+//                 // }
+//             }  
+
+//         }
+//         //MaxWidth=5;
+//         updateMu( state, model,num_leaves, MaxWidth);
+
+
+//         //npv lea;
+//         //getbots(lea);
+
+//         //for (size_t i=0;i<lea.size();i++)
+//         //{  
+//         //    outputfile <<lea[i]->cMu<<"," <<lea[i]->theta_vector[0]<<",";
+//         //}   
+//         //outputfile <<std::endl; 
+
+//         //outputfile << MaxWidth<<","<<num_leaves<<",";
+        
+//         //for (size_t i=0;i<num_leaves;i++)
+//         //{   
+//         //    outputfile << Maxmu_hat(i)<<",";
+//         //}
+
+//         // arma::vec mu_samp = rmvnorm(mu_hat[MaxWidth], Omega_inv[MaxWidth]);
+//         // for(int i = 0; i < num_leaves; i++) 
+//         // {
+//         //     leafs[i]->cMu = mu_samp(i);
+//         // }  
+
+
+//     }
+//     else
+//     {
+//         MaxWidth=1;
+//         updateMu( state, model,num_leaves, MaxWidth); 
+//         //for(size_t i = 0; i < Nv.size(); i ++ )
+//         //{
+//         //    Nv[i]->cMu = Nv[i]->theta_vector[0];
+//         // }
+//     }
+
+
+//     for(size_t i=0;i<Nv.size();i++)
+//     {
+//         Nv[i]->fWidth=Nv[i]->cWidth[MaxWidth];
+//     }
+
+
+//     //    outputfile << Nv[i]->id<<","<<Nv[i]->inNode<<"," <<Nv[i]->left<<","<<Nv[i]->right<< std::endl;
+//     //state->n_y
+//     //arma::mat wtMatrix(state->n_y,Nv.size(),arma::fill::zeros);
+//     //wtMatrix.col(0).ones();
+//     //arma::mat perMatrix(state->n_y,100,arma::fill::zeros);
+
+
+//     // for (int i=0;i<5;i++)
+//     // {
+//     //     for (int j=0;j<Nv.size();j++)
+//     //     {
+//     //         outputfile <<A(i,j)<<" ";
+//     //     }
+//     //     outputfile <<std::endl;
+//     // }
+
+//     // for(size_t i=0;i<Nv.size();i++)
+//     // {
+        
+//     //     if (Nv[i]->inNode)
+//     //     {
+            
+//     //         ParseWeigth(state,Xorder_std, model, x_struct,wtMatrix,i,Nv);
+
+//     //     }
+//     // //    outputfile << Nv[i]->id<<","<<Nv[i]->inNode<<"," <<Nv[i]->left<<","<<Nv[i]->right<< std::endl;
+//     // }
+//     //outputfile.close();
+
+// }
+
+//CK
+double activation2(double x, double c, double tau) 
+{
+  if(tau==0)
+  {
+    return (x<=c?1:0);
+  }  
+  else
+  {
+    return 1.0 - expit((x - c) / tau);
+  }
+  
+}
+
+//CK
+double activation1(double x, double c, double cw) 
+{ 
+    if(cw==0) 
+   {
+       return (x<=c?1:0);
+   }
+   else if (x<c-cw)
+   {
+       return 1;
+   }
+   else if (x>c+cw)
+   {
+       return 0;
+   }
+   else
+   {
+       return 1-(x-c+cw)/(2.0*cw);
+   }
+}
+
+//CK
+double expit(double x) 
+{
+  return 1.0 / (1.0 + exp(-x));
+}
+
+
+void tree::GetW(std::unique_ptr<State> &state, int i,int cwi) 
+{ 
+  if (!p) cWeight=1;  
+  if(l) 
+  {
+    if (cWeight==0)
+    {
+        l->cWeight=0;
+        r->cWeight=0;
+    }
+    else
+    {   
+        double weight;
+        if (state->ctType==1)
+        {
+           weight = activation1( *(state->X_std + state->n_y * v + i), c, cWidth[cwi]);
+        }
+        else
+        {
+           weight = activation2( *(state->X_std + state->n_y * v + i), c, cWidth[cwi]);
+        }   
+        
+
+        l->cWeight = weight * cWeight;
+        r->cWeight = (1 - weight) * cWeight;
+    }  
+    l->GetW(state,i,cwi);
+    r->GetW(state,i,cwi);
+  }
+}
+
+
+void tree::GetW(std::unique_ptr<State> &state, int i) 
+{ 
+  if (!p) cWeight=1;  
+  if(l) 
+  {
+    if (cWeight==0)
+    {
+        l->cWeight=0;
+        r->cWeight=0;
+    }
+    else
+    {   
+        double weight;
+
+        if (state->ctType==1)
+        {
+           weight = activation1( *(state->X_std + state->n_y * v + i), c, fWidth);
+        }
+        else
+        {
+           weight = activation2( *(state->X_std + state->n_y * v + i), c, fWidth);
+        }   
+
+
+
+        
+
+        l->cWeight = weight * cWeight;
+        r->cWeight = (1 - weight) * cWeight;
+    }  
+    l->GetW(state,i);
+    r->GetW(state,i);
+  }
+}
+//CK
+void tree::GetW(size_t ctType, const double *X, size_t i,size_t N) 
+{ 
+  if (!p) cWeight=1;  
+  if(l) 
+  {
+    if (cWeight==0)
+    {
+        l->cWeight=0;
+        r->cWeight=0;
+    }
+    else
+    {   
+        double weight;
+
+        if (ctType==1)
+        {
+           weight = activation1( *(X + N * v + i), c, fWidth);
+        }
+        else
+        {
+           weight = activation2( *(X + N * v + i), c, fWidth);
+        }   
+
+        
+
+        l->cWeight = weight * cWeight;
+        r->cWeight = (1 - weight) * cWeight;
+    }  
+    l->GetW(ctType,X,i,N);
+    r->GetW(ctType,X,i,N);
+  }
+}
+
+
+
+
+
+//arma::vec& mu_hat, 
+//arma::mat& Omega_inv,
+double tree::LogLT(
+std::unique_ptr<State> &state,
+NormalModel *model,
+const int &widIndex
+) 
+{
+  size_t num_leaves=nbots();
+  arma::vec mu_hat = arma::zeros<arma::vec>(num_leaves);
+  arma::mat Omega_inv = arma::zeros<arma::mat>(num_leaves, num_leaves);
+  GetSuffStats(state,model,num_leaves,mu_hat,Omega_inv,widIndex);
+  double  out =-0.5*  num_leaves *  ( log(M_2_PI)+   log(model->tau));
+  double val, sign;
+  log_det(val, sign, Omega_inv);
+  out -= 0.5 * val;
+  out += 0.5 * dot(mu_hat, Omega_inv * mu_hat);
+  return out;
+}
+
+//arma::vec& mu_hat, 
+//arma::mat& Omega_inv,
+double tree::LogLT(
+std::unique_ptr<State> &state,
+NormalModel *model
+) 
+{
+  size_t num_leaves=nbots();  
+  arma::vec mu_hat = arma::zeros<arma::vec>(num_leaves);
+  arma::mat Omega_inv = arma::zeros<arma::mat>(num_leaves, num_leaves);
+  GetSuffStats(state,model,num_leaves,mu_hat,Omega_inv);
+  double  out =-0.5*  num_leaves * ( log(M_2_PI)+   log(model->tau));
+  double val, sign;
+  log_det(val, sign, Omega_inv);
+  out -= 0.5 * val;
+  out += 0.5 * dot(mu_hat, Omega_inv * mu_hat);
+  return out;
+}
+
+
+void tree::GetSuffStats(
+std::unique_ptr<State> &state,
+NormalModel *model,
+const size_t &num_leaves,
+arma::vec& mu_hat_out, 
+arma::mat& Omega_inv_out,
+const int &widIndex) 
+{ 
+  npv leafs;
+  getbots(leafs);
+  arma::vec w_i = arma::zeros<arma::vec>(num_leaves);
+  arma::vec mu_hat = arma::zeros<arma::vec>(num_leaves);
+  arma::mat Lambda = arma::zeros<arma::mat>(num_leaves, num_leaves);
+
+  for(size_t i = 0; i < state->n_y; i++) 
+  {
+    GetW(state, i,widIndex);
+    for(size_t j = 0; j < num_leaves; j++) 
+    {
+      w_i(j) = leafs[j]->cWeight;
+    }
+    mu_hat = mu_hat + state->residual_std[0][i] * w_i;
+    Lambda = Lambda + w_i * arma::trans(w_i);
+  }
+
+  Lambda = Lambda / state->sigma2 ;
+  mu_hat = mu_hat / state->sigma2 ;
+  Omega_inv_out = Lambda + arma::eye(num_leaves, num_leaves) / model->tau;
+  mu_hat_out = arma::solve(Omega_inv_out, mu_hat);
+
+  
+}
+
+void tree::GetSuffStats(
+std::unique_ptr<State> &state,
+NormalModel *model,
+const size_t &num_leaves,
+arma::vec& mu_hat_out, 
+arma::mat& Omega_inv_out) 
+{ 
+  npv leafs;
+  getbots(leafs);
+  arma::vec w_i = arma::zeros<arma::vec>(num_leaves);
+  arma::vec mu_hat = arma::zeros<arma::vec>(num_leaves);
+  arma::mat Lambda = arma::zeros<arma::mat>(num_leaves, num_leaves);
+
+  for(size_t i = 0; i < state->n_y; i++) 
+  {
+    GetW(state, i);
+    for(size_t j = 0; j < num_leaves; j++) 
+    {
+      w_i(j) = leafs[j]->cWeight;
+    }
+    mu_hat = mu_hat + state->residual_std[0][i] * w_i;
+    Lambda = Lambda + w_i * arma::trans(w_i);
+  }
+
+  Lambda = Lambda / state->sigma2 ;
+  mu_hat = mu_hat / state->sigma2 ;
+  Omega_inv_out = Lambda + arma::eye(num_leaves, num_leaves) / model->tau;
+  mu_hat_out = arma::solve(Omega_inv_out, mu_hat);
+ 
+}
+
+void tree::updateMu(
+std::unique_ptr<State> &state,
+NormalModel *model,
+const size_t &num_leaves,
+const int &widIndex) 
+{ 
+  npv leafs;
+  getbots(leafs);
+  arma::vec w_i = arma::zeros<arma::vec>(num_leaves);
+  arma::vec mu_hat = arma::zeros<arma::vec>(num_leaves);
+  arma::mat Lambda = arma::zeros<arma::mat>(num_leaves, num_leaves);
+  arma::vec mu_hat_out = arma::zeros<arma::vec>(num_leaves);
+  arma::mat Omega_inv_out = arma::zeros<arma::mat>(num_leaves, num_leaves);
+
+
+
+  for(size_t i = 0; i < state->n_y; i++) 
+  {
+    GetW(state, i,widIndex);
+    for(size_t j = 0; j < num_leaves; j++) 
+    {
+      w_i(j) = leafs[j]->cWeight;
+    }
+    mu_hat = mu_hat + state->residual_std[0][i] * w_i;
+    Lambda = Lambda + w_i * arma::trans(w_i);
+  }
+
+  Lambda = Lambda / state->sigma2 ;
+  mu_hat = mu_hat / state->sigma2 ;
+  Omega_inv_out = Lambda + arma::eye(num_leaves, num_leaves) / model->tau;
+  mu_hat_out = arma::solve(Omega_inv_out, mu_hat);
+
+  arma::vec mu_samp = rmvnorm(mu_hat_out, Omega_inv_out);
+  for(size_t i = 0; i < num_leaves; i++) 
+  {
+    leafs[i]->cMu = mu_samp(i);
+  }  
+}
+//CK
+void tree::updateMu(
+std::unique_ptr<State> &state,
+NormalModel *model) 
+{ 
+  npv leafs;
+  getbots(leafs);
+  size_t num_leaves=leafs.size();
+  arma::vec w_i = arma::zeros<arma::vec>(num_leaves);
+  arma::vec mu_hat = arma::zeros<arma::vec>(num_leaves);
+  arma::mat Lambda = arma::zeros<arma::mat>(num_leaves, num_leaves);
+  arma::vec mu_hat_out = arma::zeros<arma::vec>(num_leaves);
+  arma::mat Omega_inv_out = arma::zeros<arma::mat>(num_leaves, num_leaves);
+
+
+
+  for(size_t i = 0; i < state->n_y; i++) 
+  {
+    GetW(state, i);
+    for(size_t j = 0; j < num_leaves; j++) 
+    {
+      w_i(j) = leafs[j]->cWeight;
+    }
+    mu_hat = mu_hat + state->residual_std[0][i] * w_i;
+    Lambda = Lambda + w_i * arma::trans(w_i);
+  }
+
+  Lambda = Lambda / state->sigma2 ;
+  mu_hat = mu_hat / state->sigma2 ;
+  Omega_inv_out = Lambda + arma::eye(num_leaves, num_leaves) / model->tau;
+  mu_hat_out = arma::solve(Omega_inv_out, mu_hat);
+
+  arma::vec mu_samp = rmvnorm(mu_hat_out, Omega_inv_out);
+  for(size_t i = 0; i < num_leaves; i++) 
+  {
+    leafs[i]->cMu = mu_samp(i);
+  }  
+}
+
+
+void tree::predict(std::unique_ptr<State> &state,arma::vec &out) 
+{
+  npv leafs;
+  getbots(leafs);
+  size_t num_leaves = leafs.size();
+  size_t N = state->n_y;
+
+  
+
+  for(size_t i = 0; i < N; i++) 
+  {
+    GetW(state,i);
+    for(size_t j = 0; j < num_leaves; j++) 
+    {
+      out(i) += leafs[j]->cWeight * leafs[j]->cMu;
+    }
+  }
+
+
+}
+
+//CK
+void tree::predict(size_t ctType,const double *X,size_t N,arma::vec &out) 
+{
+  npv leafs;
+  getbots(leafs);
+  size_t num_leaves = leafs.size();
+
+
+
+  for(size_t i = 0; i < N; i++) 
+  {
+    GetW(ctType,X,i,N);
+    for(size_t j = 0; j < num_leaves; j++) 
+    {
+      out(i) += leafs[j]->cWeight * leafs[j]->cMu;
+    }
+  }
+
+
+}
+
+
+
+
+
+void tree::grow_from_root(std::unique_ptr<State> &state, matrix<size_t> &Xorder_std, std::vector<size_t> &X_counts, std::vector<size_t> &X_num_unique, Model *model, std::unique_ptr<X_struct> &x_struct, const size_t &sweeps, const size_t &tree_ind, bool update_theta, bool update_split_prob, bool grow_new_tree)
+{
+    // grow a tree, users can control number of split points
+    size_t N_Xorder = Xorder_std[0].size();
+    size_t p = Xorder_std.size();
+    // size_t ind;
+    size_t split_var;
+    size_t split_point;
+
+    this->N = N_Xorder;
+
+    bool no_split = false;
+    // tau is prior VARIANCE, do not take squares
+
+    if (update_theta)
+    {
+        model->samplePars(state, this->suff_stat, this->theta_vector, this->prob_leaf);
+    }
+
+    if (N_Xorder <= state->n_min)
+    {
+        no_split = true;
+        // return;
+    }
+
+    if (this->depth >= state->max_depth - 1)
+    {
+        no_split = true;
+        // return;
+    }
+
+    // bool no_split = false;
+
+    std::vector<size_t> subset_vars(p);
+
+    if (state->use_all)
+    {
+        std::iota(subset_vars.begin(), subset_vars.end(), 0);
+    }
+    else
+    {
+        if (state->sample_weights_flag)
+        {
+            std::vector<double> weight_samp(p);
+            double weight_sum;
+
+            // Sample Weights Dirchelet
+            for (size_t i = 0; i < p; i++)
+            {
+                std::gamma_distribution<double> temp_dist(state->mtry_weight_current_tree[i], 1.0);
+                weight_samp[i] = temp_dist(state->gen);
+            }
+            weight_sum = accumulate(weight_samp.begin(), weight_samp.end(), 0.0);
+            for (size_t i = 0; i < p; i++)
+            {
+                weight_samp[i] = weight_samp[i] / weight_sum;
+            }
+
+            subset_vars = sample_int_ccrank(p, state->mtry, weight_samp, state->gen);
+        }
+        else
+        {
+            subset_vars = sample_int_ccrank(p, state->mtry, state->mtry_weight_current_tree, state->gen);
+        }
+    }
+    if (!no_split)
+    {
+        BART_likelihood_all(Xorder_std, no_split, split_var, split_point, subset_vars, X_counts, X_num_unique, model, x_struct, state, this, update_split_prob,this->M_var,this->M_point);
+    }
+    // cout << suff_stat << endl;
+
+    this->loglike_node = model->likelihood(this->suff_stat, this->suff_stat, 1, false, true, state);
+
+    if (no_split == true)
+    {
+        if (!update_split_prob)
+        {
+            // #pragma omp parallel for schedule(static, 128)
+            for (size_t i = 0; i < N_Xorder; i++)
+            {
+                x_struct->data_pointers[tree_ind][Xorder_std[0][i]] = &this->theta_vector;
+            }
+        }
+
+        if (update_theta)
+        {
+            model->samplePars(state, this->suff_stat, this->theta_vector, this->prob_leaf);
+        }
+
+        this->l = 0;
+        this->r = 0;
+
+        // update leaf prob, for MH update useage
+        // this->loglike_node = model->likelihood_no_split(this->suff_stat, state);
+
+        return;
+    }
+
+    this->maxv=-1;
+
+    if (grow_new_tree)
+    {
+        // If GROW FROM ROOT MODE
+        this->v = split_var;
+        this->c = *(state->X_std + state->n_y * split_var + Xorder_std[split_var][split_point]);
+        if (this->M_var >=0 && this->M_point>=0 )
+        {
+            this->maxv=this->M_var;
+            this->maxc=*(state->X_std + state->n_y * this->M_var + Xorder_std[this->M_var][this->M_point]); 
+        }
+
+
+
+        size_t index_in_full = 0;
+        while ((state->Xorder_std)[split_var][index_in_full] != Xorder_std[split_var][split_point])
+        {
+            index_in_full++;
+        }
+        this->c_index = (size_t)round((double)index_in_full / (double)state->n_y * (double)state->n_cutpoints);
+    }
+
+    // Update Cutpoint to be a true seperating point
+    // Increase split_point (index) until it is no longer equal to cutpoint value
+    while ((split_point < N_Xorder - 1) && (*(state->X_std + state->n_y * split_var + Xorder_std[split_var][split_point + 1]) == this->c))
+    {
+        split_point = split_point + 1;
+    }
+
+    // If our current split is same as parent, exit
+    if ((this->p) && (this->v == (this->p)->v) && (this->c == (this->p)->c))
+    {
+        return;
+    }
+
+    if (grow_new_tree)
+    {
+        // If do not update split prob ONLY
+        // grow from root, initialize new nodes
+        // #pragma omp critical
+        state->split_count_current_tree[split_var] += 1;
+
+        tree::tree_p lchild = new tree(model->getNumClasses(), this, model->dim_suffstat);
+        tree::tree_p rchild = new tree(model->getNumClasses(), this, model->dim_suffstat);
+
+        this->l = lchild;
+        this->r = rchild;
+
+        lchild->depth = this->depth + 1;
+        rchild->depth = this->depth + 1;
+
+        lchild->ID = 2 * (this->ID);
+        rchild->ID = lchild->ID + 1;
+    }
+    else
+    {
+        // For MH update usage, update probability of cutpoints given new data
+        // Do not need to initialize new nodes
+    }
+
+    this->l->ini_suff_stat();
+    this->r->ini_suff_stat();
+
+    matrix<size_t> Xorder_left_std;
+    matrix<size_t> Xorder_right_std;
+    ini_xinfo_sizet(Xorder_left_std, split_point + 1, p);
+    ini_xinfo_sizet(Xorder_right_std, N_Xorder - split_point - 1, p);
+
+    std::vector<size_t> X_num_unique_left(X_num_unique.size());
+    std::vector<size_t> X_num_unique_right(X_num_unique.size());
+
+    std::vector<size_t> X_counts_left(X_counts.size());
+    std::vector<size_t> X_counts_right(X_counts.size());
+
+    if (state->p_categorical > 0)
+    {
+        split_xorder_std_categorical(Xorder_left_std, Xorder_right_std, split_var, split_point, Xorder_std, X_counts_left, X_counts_right, X_num_unique_left, X_num_unique_right, X_counts, model, x_struct, state, this);
+    }
+
+    if (state->p_continuous > 0)
+    {
+        split_xorder_std_continuous(Xorder_left_std, Xorder_right_std, split_var, split_point, Xorder_std, model, x_struct, state, this);
+    }
+    // #pragma omp task shared(state, x_struct, model, tree_ind, sweeps)
+    // {
+    this->l->grow_from_root(state, Xorder_left_std, X_counts_left, X_num_unique_left, model, x_struct, sweeps, tree_ind, update_theta, update_split_prob, grow_new_tree);
+    // }
+    // #pragma omp task shared(state, x_struct, model, tree_ind, sweeps)
+    // {
+    this->r->grow_from_root(state, Xorder_right_std, X_counts_right, X_num_unique_right, model, x_struct, sweeps, tree_ind, update_theta, update_split_prob, grow_new_tree);
+    // }
+
+    // #pragma omp taskwait
+
+    return;
+}
+
+void calculate_entropy(matrix<size_t> &Xorder_std, std::unique_ptr<State> &state, std::vector<double> &theta_vector, double &entropy)
+{
+    size_t N_Xorder = Xorder_std[0].size();
+    size_t dim_residual = state->residual_std.size();
+    size_t next_obs;
+    double sum_fits;
+    entropy = 0.0;
+    std::vector<double> fits(dim_residual, 0.0);
+
+    for (size_t i = 0; i < N_Xorder; i++)
+    {
+        sum_fits = 0;
+        next_obs = Xorder_std[0][i];
+        for (size_t j = 0; j < dim_residual; ++j)
+        {
+            fits[j] = exp(state->residual_std[j][next_obs]) * theta_vector[j]; // f_j(x_i) = \prod lambdas
+        }
+        sum_fits = accumulate(fits.begin(), fits.end(), 0.0);
+        for (size_t j = 0; j < dim_residual; ++j)
+        {
+            entropy += -fits[j] / sum_fits * log(fits[j] / sum_fits); // entropy = sum(- p_j * log(p_j))
+        }
+    }
+
+    return;
+}
+
+
+
+
+
+void split_xorder_std_continuous(matrix<size_t> &Xorder_left_std, matrix<size_t> &Xorder_right_std, size_t split_var, size_t split_point, matrix<size_t> &Xorder_std, Model *model, std::unique_ptr<X_struct> &x_struct, std::unique_ptr<State> &state, tree *current_node)
+{
+
+    // when find the split point, split Xorder matrix to two sub matrices for both subnodes
+
+    // preserve order of other variables
+    size_t N_Xorder = Xorder_std[0].size();
+    // size_t left_ix = 0;
+    // size_t right_ix = 0;
+    size_t N_Xorder_left = Xorder_left_std[0].size();
+    size_t N_Xorder_right = Xorder_right_std[0].size();
+
+    // if the left side is smaller, we only compute sum of it
+    bool compute_left_side = N_Xorder_left < N_Xorder_right;
+
+    current_node->l->ini_suff_stat();
+    current_node->r->ini_suff_stat();
+
+    double cutvalue = *(state->X_std + state->n_y * split_var + Xorder_std[split_var][split_point]);
+
+    const double *temp_pointer = state->X_std + state->n_y * split_var;
+
+    for (size_t j = 0; j < N_Xorder; j++)
+    {
+        if (compute_left_side)
+        {
+            if (*(temp_pointer + Xorder_std[split_var][j]) <= cutvalue)
+            {
+                model->updateNodeSuffStat(current_node->l->suff_stat, state->residual_std, Xorder_std, split_var, j);
+            }
+        }
+        else
+        {
+            if (*(temp_pointer + Xorder_std[split_var][j]) > cutvalue)
+            {
+                model->updateNodeSuffStat(current_node->r->suff_stat, state->residual_std, Xorder_std, split_var, j);
+            }
+        }
+    }
+
+    const double *split_var_x_pointer = state->X_std + state->n_y * split_var;
+
+// #pragma omp parallel for schedule(dynamic, 1) default(none) shared(state, Xorder_std, Xorder_left_std, Xorder_right_std, N_Xorder, split_var_x_pointer, cutvalue)
+    for (size_t i = 0; i < state->p_continuous; i++) // loop over variables
+    {
+        // lambda callback for multithreading
+        // auto split_i = [&, i]() {
+        size_t left_ix = 0;
+        size_t right_ix = 0;
+
+        std::vector<size_t> &xo = Xorder_std[i];
+        std::vector<size_t> &xo_left = Xorder_left_std[i];
+        std::vector<size_t> &xo_right = Xorder_right_std[i];
+
+        for (size_t j = 0; j < N_Xorder; j++)
+        {
+            if (*(split_var_x_pointer + xo[j]) <= cutvalue)
+            {
+                xo_left[left_ix] = xo[j];
+                left_ix = left_ix + 1;
+            }
+            else
+            {
+                xo_right[right_ix] = xo[j];
+                right_ix = right_ix + 1;
+            }
+        }
+    }
+
+    model->calculateOtherSideSuffStat(current_node->suff_stat, current_node->l->suff_stat, current_node->r->suff_stat, N_Xorder, N_Xorder_left, N_Xorder_right, compute_left_side);
+
+    return;
+}
+
+void split_xorder_std_categorical(matrix<size_t> &Xorder_left_std, matrix<size_t> &Xorder_right_std, size_t split_var, size_t split_point, matrix<size_t> &Xorder_std, std::vector<size_t> &X_counts_left, std::vector<size_t> &X_counts_right, std::vector<size_t> &X_num_unique_left, std::vector<size_t> &X_num_unique_right, std::vector<size_t> &X_counts, Model *model, std::unique_ptr<X_struct> &x_struct, std::unique_ptr<State> &state, tree *current_node)
+{
+
+    // when find the split point, split Xorder matrix to two sub matrices for both subnodes
+
+    // preserve order of other variables
+    size_t N_Xorder = Xorder_std[0].size();
+    size_t N_Xorder_left = Xorder_left_std[0].size();
+    size_t N_Xorder_right = Xorder_right_std[0].size();
+    const double *temp_pointer = state->X_std + state->n_y * split_var;
+
+    // if the left side is smaller, we only compute sum of it
+    bool compute_left_side = N_Xorder_left < N_Xorder_right;
+
+    current_node->l->ini_suff_stat();
+    current_node->r->ini_suff_stat();
+
+    double cutvalue = *(state->X_std + state->n_y * split_var + Xorder_std[split_var][split_point]);
+
+    std::fill(X_num_unique_left.begin(), X_num_unique_left.end(), 0.0);
+    std::fill(X_num_unique_right.begin(), X_num_unique_right.end(), 0.0);
+
+// #pragma omp parallel for schedule(dynamic, 1) default(none) shared(state, temp_pointer, Xorder_std, Xorder_left_std, Xorder_right_std, N_Xorder, N_Xorder_left, N_Xorder_right, cutvalue, x_struct, compute_left_side, model, split_var, X_num_unique_left, X_num_unique_right, current_node, X_counts, X_counts_left, X_counts_right)
+
+    for (size_t i = state->p_continuous; i < state->p; i++)
+    {
+        // loop over variables
+        size_t left_ix = 0;
+        size_t right_ix = 0;
+
+        // index range of X_counts, X_values that are corresponding to current variable
+        // start <= i <= end;
+        size_t start = x_struct->variable_ind[i - state->p_continuous];
+        size_t end = x_struct->variable_ind[i + 1 - state->p_continuous];
+
+        if (i == split_var)
+        {
+            if (compute_left_side)
+            {
+                for (size_t j = 0; j < N_Xorder; j++)
+                {
+                    if (*(temp_pointer + Xorder_std[i][j]) <= cutvalue)
+                    {
+                        model->updateNodeSuffStat(current_node->l->suff_stat, state->residual_std, Xorder_std, split_var, j);
+                        Xorder_left_std[i][left_ix] = Xorder_std[i][j];
+                        left_ix = left_ix + 1;
+                    }
+                    else
+                    {
+                        // go to right side
+                        Xorder_right_std[i][right_ix] = Xorder_std[i][j];
+                        right_ix = right_ix + 1;
+                    }
+                }
+            }
+            else
+            {
+                for (size_t j = 0; j < N_Xorder; j++)
+                {
+                    if (*(temp_pointer + Xorder_std[i][j]) <= cutvalue)
+                    {
+                        Xorder_left_std[i][left_ix] = Xorder_std[i][j];
+                        left_ix = left_ix + 1;
+                    }
+                    else
+                    {
+                        model->updateNodeSuffStat(current_node->r->suff_stat, state->residual_std, Xorder_std, split_var, j);
+                        Xorder_right_std[i][right_ix] = Xorder_std[i][j];
+                        right_ix = right_ix + 1;
+                    }
+                }
+            }
+
+            // for the cut variable, it's easy to counts X_counts_left and X_counts_right, simply cut X_counts to two pieces.
+
+            for (size_t k = start; k < end; k++)
+            {
+                // loop from start to end!
+
+                if (x_struct->X_values[k] <= cutvalue)
+                {
+                    // smaller than cutvalue, go left
+                    X_counts_left[k] = X_counts[k];
+                }
+                else
+                {
+                    // otherwise go right
+                    X_counts_right[k] = X_counts[k];
+                }
+            }
+        }
+        else
+        {
+            size_t X_counts_index = start;
+            // split other variables, need to compare each row
+            for (size_t j = 0; j < N_Xorder; j++)
+            {
+                while (*(state->X_std + state->n_y * i + Xorder_std[i][j]) != x_struct->X_values[X_counts_index])
+                {
+                    //     // for the current observation, find location of corresponding unique values
+                    X_counts_index++;
+                }
+
+                if (*(temp_pointer + Xorder_std[i][j]) <= cutvalue)
+                {
+                    // go to left side
+                    Xorder_left_std[i][left_ix] = Xorder_std[i][j];
+                    left_ix = left_ix + 1;
+                    X_counts_left[X_counts_index]++;
+                }
+                else
+                {
+                    // go to right side
+                    Xorder_right_std[i][right_ix] = Xorder_std[i][j];
+                    right_ix = right_ix + 1;
+                    X_counts_right[X_counts_index]++;
+                }
+            }
+        }
+
+        for (size_t j = start; j < end; j++)
+        {
+            if (X_counts_left[j] > 0)
+            {
+                X_num_unique_left[i - state->p_continuous] = X_num_unique_left[i - state->p_continuous] + 1;
+            }
+            if (X_counts_right[j] > 0)
+            {
+                X_num_unique_right[i - state->p_continuous] = X_num_unique_right[i - state->p_continuous] + 1;
+            }
+        }
+    }
+
+    model->calculateOtherSideSuffStat(current_node->suff_stat, current_node->l->suff_stat, current_node->r->suff_stat, N_Xorder, N_Xorder_left, N_Xorder_right, compute_left_side);
+
+    // update X_num_unique
+
+    // std::fill(X_num_unique_left.begin(), X_num_unique_left.end(), 0.0);
+    // std::fill(X_num_unique_right.begin(), X_num_unique_right.end(), 0.0);
+
+    // for (size_t i = state->p_continuous; i < state->p; i++)
+    // {
+    //     start = x_struct->variable_ind[i - state->p_continuous];
+    //     end = x_struct->variable_ind[i + 1 - state->p_continuous];
+
+    //     // COUT << "start " << start << " end " << end << " size " << X_counts_left.size() << endl;
+    //     for (size_t j = start; j < end; j++)
+    //     {
+    //         if (X_counts_left[j] > 0)
+    //         {
+    //             X_num_unique_left[i - state->p_continuous] = X_num_unique_left[i - state->p_continuous] + 1;
+    //         }
+    //         if (X_counts_right[j] > 0)
+    //         {
+    //             X_num_unique_right[i - state->p_continuous] = X_num_unique_right[i - state->p_continuous] + 1;
+    //         }
+    //     }
+    // }
+
+    return;
+}
+
+void BART_likelihood_all(matrix<size_t> &Xorder_std, bool &no_split, size_t &split_var, size_t &split_point, const std::vector<size_t> &subset_vars, std::vector<size_t> &X_counts, std::vector<size_t> &X_num_unique, Model *model, std::unique_ptr<X_struct> &x_struct, std::unique_ptr<State> &state, tree *tree_pointer, bool update_split_prob,int &M_var,int &M_point)
+{
+
+    // if update_split_prob == true, only update split prob based on given split point, for MH update usage
+
+    // compute BART posterior (loglikelihood + logprior penalty)
+
+    // subset_vars: a vector of indexes of varibles to consider (like random forest)
+
+    // use stacked vector loglike instead of a matrix, stacked by column
+    // length of loglike is p * (N - 1) + 1
+    // N - 1 has to be greater than 2 * Nmin
+
+    size_t N = Xorder_std[0].size();
+    // size_t p = Xorder_std.size();
+    size_t ind;
+    size_t N_Xorder = N;
+    size_t total_categorical_split_candidates = 0;
+
+    // double sigma2 = pow(sigma, 2);
+
+    double loglike_max = -INFINITY;
+
+    std::vector<double> loglike;
+
+    size_t loglike_start;
+
+    // decide lenght of loglike vector
+    if (N <= state->n_cutpoints + 1 + 2 * state->n_min)
+    {
+        // cout << "small set " << endl;
+        loglike.resize((N_Xorder - 1) * state->p_continuous + x_struct->X_values.size() + 1, -INFINITY);
+        loglike_start = (N_Xorder - 1) * state->p_continuous;
+    }
+    else
+    {
+        // cout << "bigger set " << endl;
+        loglike.resize(state->n_cutpoints * state->p_continuous + x_struct->X_values.size() + 1, -INFINITY);
+        loglike_start = state->n_cutpoints * state->p_continuous;
+    }
+
+    // calculate for each cases
+    if (state->p_continuous > 0)
+    {
+        calculate_loglikelihood_continuous(loglike, subset_vars, N_Xorder, Xorder_std, loglike_max, model, x_struct, state, tree_pointer);
+    }
+
+    if (state->p_categorical > 0)
+    {
+        calculate_loglikelihood_categorical(loglike, loglike_start, subset_vars, N_Xorder, Xorder_std, loglike_max, X_counts, X_num_unique, model, x_struct, total_categorical_split_candidates, state, tree_pointer);
+    }
+
+    // calculate likelihood of no-split option
+    calculate_likelihood_no_split(loglike, N_Xorder, loglike_max, model, x_struct, total_categorical_split_candidates, state, tree_pointer);
+
+    // transfer loglikelihood to likelihood
+    for (size_t ii = 0; ii < loglike.size(); ii++)
+    {
+        // if a variable is not selected, take exp will becomes 0
+        loglike[ii] = exp(loglike[ii] - loglike_max);
+    }
+    // cout << "loglike " << loglike << endl;
+    // cout << " ok " << endl;
+
+    // sampling cutpoints
+    double MaxLoglike=-INFINITY;
+    int MaxInd=-1;
+    M_var=-1;
+    M_point=-1;
+    if (N <= state->n_cutpoints + 1 + 2 * state->n_min)
+    {
+
+        // N - 1 - 2 * Nmin <= Ncutpoints, consider all data points
+
+        // if number of observations is smaller than Ncutpoints, all data are splitpoint candidates
+        // note that the first Nmin and last Nmin cannot be splitpoint candidate
+
+        if ((N - 1) > 2 * state->n_min)
+        {
+            // for(size_t i = 0; i < p; i ++ ){
+            for (auto &&i : subset_vars)
+            {
+                if (i < state->p_continuous)
+                {
+                    // delete some candidates, otherwise size of the new node can be smaller than Nmin
+                    std::fill(loglike.begin() + i * (N - 1), loglike.begin() + i * (N - 1) + state->n_min + 1, 0.0);
+                    std::fill(loglike.begin() + i * (N - 1) + N - 2 - state->n_min, loglike.begin() + i * (N - 1) + N - 2 + 1, 0.0);
+                }
+            }
+        }
+        else
+        {
+            // do not use all continuous variables
+            if (state->p_continuous > 0)
+            {
+                std::fill(loglike.begin(), loglike.begin() + (N_Xorder - 1) * state->p_continuous - 1, 0.0);
+            }
+        }
+
+        std::discrete_distribution<> d(loglike.begin(), loglike.end());
+
+        // for MH update usage only
+        tree_pointer->num_cutpoint_candidates = count_non_zero(loglike);
+
+        if (update_split_prob)
+        {
+            ind = tree_pointer->drawn_ind;
+        }
+        else
+        {
+            // sample one index of split point
+            ind = d(state->gen);
+            tree_pointer->drawn_ind = ind;
+        }
+
+        // save the posterior of the chosen split point
+        vec_sum(loglike, tree_pointer->prob_split);
+
+        for (size_t i1=0;i1<loglike.size() - 1;i1++)
+        {
+            if ((loglike[i1] >0) && (MaxLoglike<loglike[i1]))
+            {
+                MaxLoglike=loglike[i1];
+                MaxInd=i1;
+            }
+        }
+        tree_pointer->prob_split = loglike[ind] / tree_pointer->prob_split;
+
+        if (ind == loglike.size() - 1)
+        {
+            // no split
+            no_split = true;
+            split_var = 0;
+            split_point = 0;
+            M_var=-1;
+            M_point=-1;
+
+        }
+        else if ((N - 1) <= 2 * state->n_min)
+        {
+            // np split
+
+            /////////////////////////////////
+            //
+            // Need optimization, move before calculating likelihood
+            //
+            /////////////////////////////////
+
+            no_split = true;
+            split_var = 0;
+            split_point = 0;
+            M_var=-1;
+            M_point=-1;
+        }
+        else if (ind < loglike_start)
+        {
+            // split at continuous variable
+            split_var = ind / (N - 1);
+            split_point = ind % (N - 1);
+            M_var=MaxInd/(N-1);
+            M_point=MaxInd % (N - 1);
+        }
+        else
+        {
+            // split at categorical variable
+            size_t start;
+            ind = ind - loglike_start;
+            for (size_t i = 0; i < (x_struct->variable_ind.size() - 1); i++)
+            {
+                if (x_struct->variable_ind[i] <= ind && x_struct->variable_ind[i + 1] > ind)
+                {
+                    split_var = i;
+                }
+            }
+            start = x_struct->variable_ind[split_var];
+            // count how many
+            split_point = std::accumulate(X_counts.begin() + start, X_counts.begin() + ind + 1, 0);
+            // minus one for correct index (start from 0)
+            if (split_point > 0)
+            {
+                split_point = split_point - 1;
+            }
+            split_var = split_var + state->p_continuous;
+            M_var=-1;
+            M_point=-1;
+        }
+    }
+    else
+    {
+        // use adaptive number of cutpoints
+
+        std::vector<size_t> candidate_index(state->n_cutpoints);
+
+        seq_gen_std(state->n_min, N - state->n_min, state->n_cutpoints, candidate_index);
+
+        std::discrete_distribution<size_t> d(loglike.begin(), loglike.end());
+
+        // For MH update usage only
+        tree_pointer->num_cutpoint_candidates = count_non_zero(loglike);
+
+        if (update_split_prob)
+        {
+            ind = tree_pointer->drawn_ind;
+        }
+        else
+        {
+            // // sample one index of split point
+            ind = d(state->gen);
+            tree_pointer->drawn_ind = ind;
+        }
+
+        // save the posterior of the chosen split point
+        vec_sum(loglike, tree_pointer->prob_split);
+        for (size_t i1=0;i1<loglike.size() - 1;i1++)
+        {
+            if ((loglike[i1] >0) && (MaxLoglike<loglike[i1]))
+            {
+                MaxLoglike=loglike[i1];
+                MaxInd=i1;
+            }
+        }
+        tree_pointer->prob_split = loglike[ind] / tree_pointer->prob_split;
+
+        if (ind == loglike.size() - 1)
+        {
+            // no split
+            no_split = true;
+            split_var = 0;
+            split_point = 0;
+            M_var=-1;
+            M_point=-1;
+        }
+        else if (ind < loglike_start)
+        {
+            // split at continuous variable
+            split_var = ind / state->n_cutpoints;
+            split_point = candidate_index[ind % state->n_cutpoints];
+            M_var=MaxInd/state->n_cutpoints;
+            M_point= candidate_index[MaxInd % state->n_cutpoints];
+        }
+        else
+        {
+            // split at categorical variable
+            size_t start;
+            ind = ind - loglike_start;
+            for (size_t i = 0; i < (x_struct->variable_ind.size() - 1); i++)
+            {
+                if (x_struct->variable_ind[i] <= ind && x_struct->variable_ind[i + 1] > ind)
+                {
+                    split_var = i;
+                }
+            }
+            start = x_struct->variable_ind[split_var];
+            // count how many
+            split_point = std::accumulate(X_counts.begin() + start, X_counts.begin() + ind + 1, 0);
+            // minus one for correct index (start from 0)
+            if (split_point > 0)
+            {
+                split_point = split_point - 1;
+            }
+            split_var = split_var + state->p_continuous;
+
+            M_var=-1;
+            M_point=-1;  
+
+        }
+    }
+
+    return;
+}
+
+void calculate_loglikelihood_continuous(std::vector<double> &loglike, const std::vector<size_t> &subset_vars, size_t &N_Xorder, matrix<size_t> &Xorder_std, double &loglike_max, Model *model, std::unique_ptr<X_struct> &x_struct, std::unique_ptr<State> &state, tree *tree_pointer)
+{
+
+    size_t N = N_Xorder;
+
+    if (N_Xorder <= state->n_cutpoints + 1 + 2 * state->n_min)
+    {
+        // if we only have a few data observations in current node
+        // use all of them as cutpoint candidates
+
+        // double n1tau;
+        // double n2tau;
+        // double Ntau = N_Xorder * model->tau;
+
+        // to have a generalized function, have to pass an empty candidate_index object for this case
+        // is there any smarter way to do it?
+        std::vector<size_t> candidate_index(1);
+
+        // set up parallel during burnin
+        //  state->p_continuous * state->nthread > 100 // this is approximately the cost to set up parallel for
+        // #pragma omp parallel for if(state->use_all & state->p_continuous * state->nthread > 120) schedule(dynamic, 1) default(none) shared(N_Xorder, state, subset_vars, Xorder_std, model, candidate_index, tree_pointer, loglike, loglike_max)
+        for (auto i : subset_vars)
+        {
+#pragma omp task firstprivate(i) shared(N_Xorder, Xorder_std, subset_vars, state, tree_pointer, candidate_index, model, loglike, loglike_max)
+            {
+                // size_t i = subset_vars[var_i];
+
+                if (i < state->p_continuous)
+                {
+                    std::vector<size_t> &xorder = Xorder_std[i];
+
+                    // initialize sufficient statistics
+                    std::vector<double> temp_suff_stat(model->dim_suffstat);
+                    std::fill(temp_suff_stat.begin(), temp_suff_stat.end(), 0.0);
+
+                    for (size_t j = 0; j < N_Xorder - 1; j++)
+                    {
+                        calcSuffStat_continuous(temp_suff_stat, xorder, candidate_index, j, false, model, state->residual_std);
+
+                        loglike[(N_Xorder - 1) * i + j] = model->likelihood(temp_suff_stat, tree_pointer->suff_stat, j, true, false, state) + model->likelihood(temp_suff_stat, tree_pointer->suff_stat, j, false, false, state);
+
+                        loglike_max = loglike_max > loglike[(N_Xorder - 1) * i + j] ? loglike_max : loglike[(N_Xorder - 1) * i + j];
+                    }
+                }
+            }
+        }
+#pragma omp taskwait
+    }
+    else
+    {
+
+        // otherwise, adaptive number of cutpoints
+        // use Ncutpoints
+
+        std::vector<size_t> candidate_index2(state->n_cutpoints + 1);
+        seq_gen_std2(state->n_min, N - state->n_min, state->n_cutpoints, candidate_index2);
+        // size_t p_continuous = state->p_continuous;
+
+        // set up parallel during burnin?
+        // state->p_continuous * state->nthread > 100 // this is approximately the cost to set up parallel for
+        for (auto i : subset_vars)
+        {
+#pragma omp task firstprivate(i) shared(Xorder_std, subset_vars, state, tree_pointer, candidate_index2, model, loglike, loglike_max)
+            {
+                if (i < state->p_continuous)
+                {
+
+                    std::vector<size_t> &xorder = Xorder_std[i];
+
+                    std::vector<double> temp_suff_stat(model->dim_suffstat);
+                    std::fill(temp_suff_stat.begin(), temp_suff_stat.end(), 0.0);
+
+                    for (size_t j = 0; j < state->n_cutpoints; j++)
+                    {
+                        calcSuffStat_continuous(temp_suff_stat, xorder, candidate_index2, j, true, model, state->residual_std);
+                        // move likelihood calculation to a new thread
+                        loglike[(state->n_cutpoints) * i + j] = model->likelihood(temp_suff_stat, tree_pointer->suff_stat, candidate_index2[j + 1], true, false, state) + model->likelihood(temp_suff_stat, tree_pointer->suff_stat, candidate_index2[j + 1], false, false, state);
+                        loglike_max = loglike_max > loglike[(state->n_cutpoints) * i + j] ? loglike_max : loglike[(state->n_cutpoints) * i + j];
+                    }
+                }
+            }
+        }
+#pragma omp taskwait
+    }
+}
+
+void calculate_loglikelihood_categorical(std::vector<double> &loglike, size_t &loglike_start, const std::vector<size_t> &subset_vars, size_t &N_Xorder, matrix<size_t> &Xorder_std, double &loglike_max, std::vector<size_t> &X_counts, std::vector<size_t> &X_num_unique, Model *model, std::unique_ptr<X_struct> &x_struct, size_t &total_categorical_split_candidates, std::unique_ptr<State> &state, tree *tree_pointer)
+{
+
+    // loglike_start is an index to offset
+    // consider loglikelihood start from loglike_start
+
+    // size_t N = N_Xorder;
+    // size_t effective_cutpoints = 0;
+
+    // #pragma omp parallel for
+    //schedule(dynamic, 1)
+    // #pragma omp parallel for if(state->use_all & state->p_categorical * state->nthread > 140) schedule(dynamic, 1) default(none) shared(loglike_start, x_struct, X_counts,X_num_unique,  state, subset_vars, Xorder_std, model, tree_pointer, loglike, loglike_max)
+    for (size_t var_i = 0; var_i < subset_vars.size(); var_i++)
+    {
+
+        size_t i = subset_vars[var_i]; // get subset varaible
+
+        // size_t var_effective_cutpoints = 0;
+
+        if ((i >= state->p_continuous) && (X_num_unique[i - state->p_continuous] > 1))
+        {
+#pragma omp task firstprivate(i) shared(x_struct, state, model, X_counts, Xorder_std, loglike_start, loglike, loglike_max, tree_pointer)
+            {
+                std::vector<double> temp_suff_stat(model->dim_suffstat);
+                std::fill(temp_suff_stat.begin(), temp_suff_stat.end(), 0.0);
+                size_t start, end, end2, n1, temp;
+
+                start = x_struct->variable_ind[i - state->p_continuous];
+                end = x_struct->variable_ind[i + 1 - state->p_continuous] - 1; // minus one for indexing starting at 0
+                end2 = end;
+
+                while (X_counts[end2] == 0)
+                {
+                    // move backward if the last unique value has zero counts
+                    end2 = end2 - 1;
+                    // COUT << end2 << endl;
+                }
+                // move backward again, do not consider the last unique value as cutpoint
+                end2 = end2 - 1;
+
+                n1 = 0;
+
+                for (size_t j = start; j <= end2; j++)
+                {
+
+                    if (X_counts[j] != 0)
+                    {
+
+                        temp = n1 + X_counts[j] - 1;
+
+                        // modify sufficient statistics vector directly inside model class
+                        // model->calcSuffStat_categorical(temp_suff_stat, state->residual_std, Xorder_std, n1, temp, i);
+                        calcSuffStat_categorical(temp_suff_stat, Xorder_std[i], n1, temp, model, state);
+
+                        n1 = n1 + X_counts[j];
+
+                        // #pragma omp task firstprivate(temp_suff_stat, j, n1) shared(loglike_start, state, tree_pointer, model, loglike, loglike_max)
+                        // {
+                        loglike[loglike_start + j] = model->likelihood(temp_suff_stat, tree_pointer->suff_stat, n1 - 1, true, false, state) + model->likelihood(temp_suff_stat, tree_pointer->suff_stat, n1 - 1, false, false, state);
+
+                        // count total number of cutpoint candidates
+                        // var_effective_cutpoints++; // need to be added in task shared
+                        // #pragma omp flush(var_effective_cutpoints);
+
+                        loglike_max = loglike_max > loglike[loglike_start + j] ? loglike_max : loglike[loglike_start + j];
+                        // }
+                    }
+                }
+            }
+        }
+    }
+#pragma omp taskwait
+}
+
+void calculate_likelihood_no_split(std::vector<double> &loglike, size_t &N_Xorder, double &loglike_max, Model *model, std::unique_ptr<X_struct> &x_struct, size_t &total_categorical_split_candidates, std::unique_ptr<State> &state, tree *tree_pointer)
+{
+    size_t loglike_size = 0;
+    for (size_t i = 0; i < loglike.size(); i++)
+    {
+        if (loglike[i] > -INFINITY)
+        {
+            loglike_size += 1;
+        }
+    }
+    if (loglike_size > 0)
+    {
+        loglike[loglike.size() - 1] = model->likelihood(tree_pointer->suff_stat, tree_pointer->suff_stat, loglike.size() - 1, false, true, state) + log(pow(1.0 + tree_pointer->getdepth(), model->beta) / model->alpha - 1.0) + log((double)loglike_size) + log(model->getNoSplitPenality());
+        // !!Note loglike_size shouldn't get minus 1 when it count non zero of loglike.
+    }
+    else
+    {
+        loglike[loglike.size() - 1] = 1;
+    }
+
+    // loglike[loglike.size() - 1] = model->likelihood(tree_pointer->suff_stat, tree_pointer->suff_stat, loglike.size() - 1, false, true, state) + log(pow(1.0 + tree_pointer->getdepth(), model->beta) / model->alpha - 1.0) + log((double)loglike.size() - 1.0) + log(model->getNoSplitPenality());
+
+    //cout << loglike << endl;
+    // then adjust according to number of variables and split points
+
+    ////////////////////////////////////////////////////////////////
+    //
+    //  For now, I didn't test much weights, but set it as p * Ncutpoints for all cases
+    //
+    //  BE CAREFUL, p is total number of variables, p = p_continuous + p_categorical
+    //
+    //  We might want to scale by mtry, the actual number of variables used in the current fit
+    //
+    //  WARNING, you need to consider weighting for both continuous and categorical variables here
+    //
+    //  This is the only function calculating no-split likelihood
+    //
+    ////////////////////////////////////////////////////////////////
+
+    // loglike[loglike.size() - 1] += log(state->p) + log(2.0) + model->getNoSplitPenality();
+
+    ////////////////////////////////////////////////////////////////
+    // The loop below might be useful when test different weights
+
+    // if (p_continuous > 0)
+    // {
+    //     // if using continuous variable
+    //     if (N_Xorder <= Ncutpoints + 1 + 2 * Nmin)
+    //     {
+    //         loglike[loglike.size() - 1] += log(p) + log(Ncutpoints);
+    //     }
+    //     else
+    //     {
+    //         loglike[loglike.size() - 1] += log(p) + log(Ncutpoints);
+    //     }
+    // }
+
+    // if (p > p_continuous)
+    // {
+    //     COUT << "total_categorical_split_candidates  " << total_categorical_split_candidates << endl;
+    //     // if using categorical variables
+    //     // loglike[loglike.size() - 1] += log(total_categorical_split_candidates);
+    // }
+
+    // loglike[loglike.size() - 1] += log(p - p_continuous) + log(Ncutpoints);
+
+    // this is important, update maximum of loglike vector
+    if (loglike[loglike.size() - 1] > loglike_max)
+    {
+        loglike_max = loglike[loglike.size() - 1];
+    }
+}
+
+// void predict_from_tree(tree &tree, const double *X_std, size_t N, size_t p, std::vector<double> &output, Model *model)
+// {
+//     tree::tree_p bn;
+//     for (size_t i = 0; i < N; i++)
+//     {
+//         bn = tree.search_bottom_std(X_std, i, p, N);
+//         output[i] = model->predictFromTheta(bn->theta_vector);
+//     }
+//     return;
+// }
+
+// void predict_from_datapointers(size_t tree_ind, Model *model, std::unique_ptr<State> &state, std::unique_ptr<X_struct> &x_struct)
+// {
+//     // // tree search, but read from the matrix of pointers to end node directly
+//     // // easier to get fitted value of training set
+//     // for (size_t i = 0; i < state->n_y; i++)
+//     // {
+//     //     state->predictions_std[tree_ind][i] = model->predictFromTheta(*(x_struct->data_pointers[tree_ind][i]));
+//     // }
+//     // return;
+// }
+
+void calcSuffStat_categorical(std::vector<double> &temp_suff_stat, std::vector<size_t> &xorder, size_t &start, size_t &end, Model *model, std::unique_ptr<State> &state)
+{
+    // calculate sufficient statistics for categorical variables
+
+    // compute sum of y[Xorder[start:end, var]]
+    for (size_t i = start; i <= end; i++)
+    {
+        // Model::suff_stat_model[0] += y[Xorder[var][i]];
+        model->incSuffStat(state->residual_std, xorder[i], temp_suff_stat);
+    }
+    return;
+}
+
+void calcSuffStat_continuous(std::vector<double> &temp_suff_stat, std::vector<size_t> &xorder, std::vector<size_t> &candidate_index, size_t index, bool adaptive_cutpoint, Model *model, matrix<double> &residual_std)
+{
+    // calculate sufficient statistics for continuous variables
+
+    if (adaptive_cutpoint)
+    {
+
+        if (index == 0)
+        {
+            // initialize, only for the first cutpoint candidate, thus index == 0
+            model->incSuffStat(residual_std, xorder[0], temp_suff_stat);
+        }
+
+        // if use adaptive number of cutpoints, calculated based on vector candidate_index
+        for (size_t q = candidate_index[index] + 1; q <= candidate_index[index + 1]; q++)
+        {
+            model->incSuffStat(residual_std, xorder[q], temp_suff_stat);
+        }
+    }
+    else
+    {
+        // use all data points as candidates
+        model->incSuffStat(residual_std, xorder[index], temp_suff_stat);
+    }
+    return;
+}
+
+void getTheta_Insample(matrix<double> &output, size_t tree_ind, std::unique_ptr<State> &state, std::unique_ptr<X_struct> &x_struct)
+{
+    // get theta of ALL observations of ONE tree, in sample fit
+    // input is x_struct because it is in sample
+
+    // output should have dimension (dim_theta, num_obs)
+
+    for (size_t i = 0; i < state->n_y; i++)
+    {
+        output[i] = *(x_struct->data_pointers[tree_ind][i]);
+    }
+    return;
+}
+
+void getTheta_Outsample(matrix<double> &output, tree &tree, const double *Xtest, size_t N_Xtest, size_t p)
+{
+    // get theta of ALL observations of ONE tree, out sample fit
+    // input is a pointer to testing set matrix because it is out of sample
+    // tree is a single tree to look at
+
+    // output should have dimension (dim_theta, num_obs)
+
+    tree::tree_p bn; // pointer to bottom node
+    for (size_t i = 0; i < N_Xtest; i++)
+    {
+        // loop over observations
+        // tree search
+        bn = tree.search_bottom_std(Xtest, i, p, N_Xtest);
+        output[i] = bn->theta_vector;
+    }
+
+    return;
+}
+
+void getThetaForObs_Insample(matrix<double> &output, size_t x_index, std::unique_ptr<State> &state, std::unique_ptr<X_struct> &x_struct)
+{
+    // get theta of ONE observation of ALL trees, in sample fit
+    // input is x_struct because it is in sample
+
+    // output should have dimension (dim_theta, num_trees)
+
+    for (size_t i = 0; i < state->num_trees; i++)
+    {
+        output[i] = *(x_struct->data_pointers[i][x_index]);
+    }
+
+    return;
+}
+
+void getThetaForObs_Outsample(
+matrix<double> &output, 
+std::vector<tree> &tree, 
+size_t x_index, 
+const double *Xtest, 
+size_t N_Xtest, 
+size_t p)
+{
+    // get theta of ONE observation of ALL trees, out sample fit
+    // input is a pointer to testing set matrix because it is out of sample
+    // tree is a vector of all trees
+
+    // output should have dimension (dim_theta, num_trees)
+
+    tree::tree_p bn; // pointer to bottom node
+
+    for (size_t i = 0; i < tree.size(); i++)
+    {
+        // loop over trees
+        // tree search
+        bn = tree[i].search_bottom_std(Xtest, x_index, p, N_Xtest);
+        output[i] = bn->theta_vector;
+    }
+    return;
+}
+
+
+
+
+
+void getThetaForObs_Outsample_ave(matrix<double> &output, std::vector<tree> &tree, size_t x_index, const double *Xtest, size_t N_Xtest, size_t p)
+{
+    // This function takes AVERAGE of ALL thetas on the PATH to leaf node
+
+    // get theta of ONE observation of ALL trees, out sample fit
+    // input is a pointer to testing set matrix because it is out of sample
+    // tree is a vector of all trees
+
+    // output should have dimension (dim_theta, num_trees)
+
+    tree::tree_p bn; // pointer to bottom node
+    size_t count = 1;
+
+    for (size_t i = 0; i < tree.size(); i++)
+    {
+
+        // loop over trees
+        // tree search
+        bn = &tree[i]; // start from root node
+
+        std::fill(output[i].begin(), output[i].end(), 0.0);
+        count = 0;
+
+        while (bn->getl())
+        {
+            // while bn has child (not bottom node)
+
+            output[i] = output[i] + bn->theta_vector;
+            count++;
+
+            // move to the next level
+            if (*(Xtest + N_Xtest * bn->getv() + x_index) <= bn->getc())
+            {
+                bn = bn->getl();
+            }
+            else
+            {
+                bn = bn->getr();
+            }
+        }
+
+        // bn is the bottom node
+
+        output[i] = output[i] + bn->theta_vector;
+        count++;
+
+        // take average of the path
+        for (size_t j = 0; j < output[i].size(); j++)
+        {
+            output[i][j] = output[i][j] / (double)count;
+        }
+    }
+
+    return;
+}
+
+
+#ifndef NoRcpp
+#endif

@@ -1,0 +1,8 @@
+useDynLib(XSBART, .registration=TRUE)
+exportPattern("^[[:alpha:]]+")
+importFrom(Rcpp, evalCpp)
+importFrom(stats, predict, pnorm, quantile, runif, sd)
+importFrom(tools, psnice)
+importFrom(glmnet, cv.glmnet)
+importFrom(stats, model.matrix, var)
+S3method(predict, XSBART)
